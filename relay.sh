@@ -2,21 +2,29 @@
 # =====================================================================
 #  Pronet Relay — VLESS + TCP + TLS (Hetzner rDNS cert) behind a relay
 #
-#  Path:  user --443--> ENTRY (HAProxy) --8447 + PROXY v2--> EXIT (PasarGuard node)
+#  user --443--> ENTRY (HAProxy, Hetzner) --8447 + PROXY v2--> EXIT (PasarGuard node)
 #
-#  Usage (menu):            bash relay.sh
-#  Usage (direct):
-#     EXIT  server:         bash relay.sh exit  ENTRY_IP[,ENTRY_IP2] EMAIL
-#     ENTRY server:         bash relay.sh entry EXIT_PUBLIC_IP [EXIT_PRIVATE_IP]
-#     EXIT  show cert:      bash relay.sh cert
-#     EXIT  add entry IP:   bash relay.sh add-entry IP
-#     ENTRY add exit:       bash relay.sh add-exit EXIT_PUBLIC_IP [EXIT_PRIVATE_IP]
-#     Status (any):         bash relay.sh status
+#  Mode A: EXIT is Hetzner  -> certificate on EXIT, SNI = exit hostname
+#          (one entry can serve many Hetzner exits, routed by SNI)
+#  Mode B: EXIT is anywhere (Turkey, ...) -> certificate on ENTRY, SNI = entry hostname
+#          (one entry serves one non-Hetzner exit)
+#
+#  Run:  bash <(curl -fsSL https://raw.githubusercontent.com/alirezaaabbasii/pronet-relay/main/relay.sh)
+#
+#  Direct commands:
+#    exit      ENTRY_IP[,IP2] EMAIL   EXIT, Hetzner (mode A)
+#    exit-ext  ENTRY_IP[,IP2] EMAIL   EXIT, other datacenter (mode B)
+#    entry     EXIT_IP [EXIT_PRIV]    ENTRY for a Hetzner exit (mode A)
+#    entry-ext EXIT_IP EMAIL          ENTRY for a non-Hetzner exit (mode B)
+#    cert                             print certificate + key again
+#    add-entry IP                     EXIT: allow another entry IP
+#    status                           status / test
 # =====================================================================
 set -euo pipefail
 
 RAW_URL="https://raw.githubusercontent.com/alirezaaabbasii/pronet-relay/main/relay.sh"
-PORT=8447                       # inbound port on EXIT (must match PasarGuard inbound)
+RUN="bash <(curl -fsSL $RAW_URL)"
+PORT=8447                       # inbound port on EXIT (must match the PasarGuard inbound)
 STATE=/etc/pronet-relay
 FW_SCRIPT=/usr/local/sbin/pronet-relay-fw.sh
 FW_UNIT=/etc/systemd/system/pronet-relay-fw.service
@@ -34,12 +42,57 @@ mkdir -p "$STATE"
 valid_ip(){ [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 hz_host(){ local a b c d; IFS=. read -r a b c d <<<"$1"; echo "static.$d.$c.$b.$a.clients.your-server.de"; }
 my_ip(){ ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}'; }
+public_ip(){ curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || my_ip; }
 ask(){ local v; read -rp "$1: " v; echo "$v"; }
 
 enable_bbr(){
   grep -q "tcp_congestion_control=bbr" /etc/sysctl.conf || \
     printf "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n" >> /etc/sysctl.conf
   sysctl -p >/dev/null 2>&1 || true
+  ok "BBR enabled"
+}
+
+check_hz_name(){   # $1 ip -> prints hostname or dies
+  local host res
+  host=$(hz_host "$1")
+  res=$(getent ahostsv4 "$host" | awk 'NR==1{print $1}' || true)
+  [[ "$res" == "$1" ]] || die "$host does not resolve to $1 (this must be a Hetzner server with default rDNS)"
+  echo "$host"
+}
+
+install_acme(){   # $1 email
+  apt-get update -qq && apt-get install -y -qq socat curl cron openssl >/dev/null
+  [[ -x $ACME ]] || curl -s https://get.acme.sh | sh -s email="$1" >/dev/null
+}
+
+issue_cert(){   # $1 host  $2 email  $3 out_dir  $4 reloadcmd  [hooks...]
+  local host="$1" email="$2" out="$3" reload="$4"; shift 4
+  mkdir -p "$out"
+  if $ACME --list | grep -q "$host"; then
+    ok "Certificate already exists — skipping issuance"
+  elif ! $ACME --issue --standalone -d "$host" --keylength ec-256 --server letsencrypt "$@"; then
+    warn "Let's Encrypt failed — trying ZeroSSL"
+    $ACME --register-account -m "$email" --server zerossl >/dev/null
+    $ACME --issue --standalone -d "$host" --keylength ec-256 --server zerossl "$@" || return 1
+  fi
+  $ACME --install-cert -d "$host" --ecc \
+    --key-file "$out/hz.key" --fullchain-file "$out/hz.crt" \
+    --reloadcmd "$reload" >/dev/null
+  echo "$host" >"$STATE/cert_host"; echo "$out" >"$STATE/cert_dir"
+  ok "Certificate installed"
+}
+
+print_cert(){
+  local host dir exp
+  host=$(cat "$STATE/cert_host" 2>/dev/null) || die "No certificate on this server"
+  dir=$(cat "$STATE/cert_dir")
+  exp=$(openssl x509 -enddate -noout -in "$dir/hz.crt" | cut -d= -f2)
+  echo -e "\n${c_ylw}Certificate for $host — expires: $exp${c_off}"
+  echo "########## CERTIFICATE (copy from BEGIN to last END) ##########"
+  cat "$dir/hz.crt"
+  echo "########## KEY ##########"
+  cat "$dir/hz.key"
+  echo "##########################"
 }
 
 # ------------------------------------------------------------- EXIT ---
@@ -53,8 +106,15 @@ node_container(){
 node_dir(){
   local mnt
   mnt=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$1" | grep -E '^/var/lib' | head -1 || true)
-  [[ -n "$mnt" ]] || mnt=/var/lib/pg-node
-  echo "$mnt"
+  echo "${mnt:-/var/lib/pg-node}"
+}
+
+add_entries(){   # $1 = comma separated IPs
+  local ip
+  for ip in ${1//,/ }; do
+    valid_ip "$ip" || die "Invalid IP: $ip"
+    grep -qx "$ip" "$STATE/entries.list" 2>/dev/null || echo "$ip" >>"$STATE/entries.list"
+  done
 }
 
 write_firewall(){
@@ -85,50 +145,28 @@ EOF
   systemctl enable pronet-relay-fw.service >/dev/null 2>&1
   systemctl restart pronet-relay-fw.service
   if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
-    ufw allow 80/tcp >/dev/null
     while read -r ip; do [[ -n "$ip" ]] && ufw allow from "$ip" to any port "$PORT" proto tcp >/dev/null; done <"$list"
   fi
   ok "Port $PORT open only for: $(paste -sd, "$list")"
 }
 
-add_entries(){   # $1 = comma separated IPs
-  local ip
-  for ip in ${1//,/ }; do
-    valid_ip "$ip" || die "Invalid IP: $ip"
-    grep -qx "$ip" "$STATE/entries.list" 2>/dev/null || echo "$ip" >>"$STATE/entries.list"
-  done
+ask_entries_email(){   # sets ENTRIES EMAIL
+  ENTRIES="${1:-}"; EMAIL="${2:-}"
+  [[ -n "$ENTRIES" ]] || ENTRIES=$(ask "ENTRY server IP (several: comma separated)")
+  [[ -n "$EMAIL"   ]] || EMAIL=$(ask "Email for the certificate")
+  [[ -n "$ENTRIES" && -n "$EMAIL" ]] || die "Entry IP and email are required"
 }
 
-print_cert(){
-  local host dir exp
-  host=$(cat "$STATE/exit_host" 2>/dev/null) || die "Exit not set up on this server"
-  dir=$(cat "$STATE/node_dir")
-  exp=$(openssl x509 -enddate -noout -in "$dir/certs/hz.crt" | cut -d= -f2)
-  echo -e "\n${c_ylw}Certificate for $host — expires: $exp${c_off}"
-  echo "########## CERTIFICATE (copy from BEGIN to last END) ##########"
-  cat "$dir/certs/hz.crt"
-  echo "########## KEY ##########"
-  cat "$dir/certs/hz.key"
-  echo "##########################"
-}
-
+# Mode A: Hetzner exit, cert here
 setup_exit(){
-  local entries="${1:-}" email="${2:-}" ip host res cnt dir hook=()
-  [[ -n "$entries" ]] || entries=$(ask "ENTRY server IP (several: comma separated)")
-  [[ -n "$email"   ]] || email=$(ask "Email for the certificate")
-  [[ -n "$entries" && -n "$email" ]] || die "Entry IP and email are required"
-
+  local ip host cnt dir hook=()
+  ask_entries_email "${1:-}" "${2:-}"
   say "Checking this server"
-  ip=$(my_ip); host=$(hz_host "$ip")
-  res=$(getent ahostsv4 "$host" | awk 'NR==1{print $1}' || true)
-  echo "IP:   $ip"; echo "HOST: $host -> ${res:-not resolved}"
-  [[ "$res" == "$ip" ]] || die "Hostname does not resolve to this server (Hetzner IP with default rDNS required)"
+  ip=$(my_ip); host=$(check_hz_name "$ip")
+  echo "IP: $ip   HOST: $host"
   command -v docker >/dev/null || die "Docker not found — install PasarGuard node first"
   cnt=$(node_container); dir=$(node_dir "$cnt")
   echo "Node container: $cnt   data dir: $dir"
-  mkdir -p "$dir/certs"
-  echo "$host" >"$STATE/exit_host"; echo "$dir" >"$STATE/node_dir"; echo "$cnt" >"$STATE/node_cnt"
-
   if ss -ltnp "sport = :80" | grep -q LISTEN; then
     if ss -ltnp "sport = :80" | grep -q '"xray"'; then
       warn "Port 80 is used by the node's Xray — node is stopped ~30s during issue/renew"
@@ -137,45 +175,66 @@ setup_exit(){
       die "Port 80 busy by another program: $(ss -ltnp 'sport = :80' | tail -1)"
     fi
   fi
-
-  say "Installing acme.sh"
-  apt-get update -qq && apt-get install -y -qq socat curl cron openssl >/dev/null
-  [[ -x $ACME ]] || curl -s https://get.acme.sh | sh -s email="$email" >/dev/null
+  if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then ufw allow 80/tcp >/dev/null; fi
 
   say "Certificate for $host"
-  if $ACME --list | grep -q "$host"; then
-    ok "Certificate already exists — skipping issuance"
-  elif ! $ACME --issue --standalone -d "$host" --keylength ec-256 --server letsencrypt "${hook[@]}"; then
-    warn "Let's Encrypt failed — trying ZeroSSL"
-    $ACME --register-account -m "$email" --server zerossl >/dev/null
-    $ACME --issue --standalone -d "$host" --keylength ec-256 --server zerossl "${hook[@]}" || { docker start "$cnt" >/dev/null 2>&1 || true; die "Certificate issuance failed"; }
-  fi
+  install_acme "$EMAIL"
+  issue_cert "$host" "$EMAIL" "$dir/certs" "docker restart $cnt" "${hook[@]}" \
+    || { docker start "$cnt" >/dev/null 2>&1 || true; die "Certificate issuance failed"; }
   docker start "$cnt" >/dev/null 2>&1 || true
-  $ACME --install-cert -d "$host" --ecc \
-    --key-file "$dir/certs/hz.key" --fullchain-file "$dir/certs/hz.crt" \
-    --reloadcmd "docker restart $cnt" >/dev/null
-  ok "Certificate installed"
 
-  say "Firewall"
-  add_entries "$entries"
-  write_firewall
-
-  say "BBR"; enable_bbr; ok "done"
-
+  say "Firewall"; add_entries "$ENTRIES"; write_firewall
+  say "BBR"; enable_bbr
   print_cert
   cat <<EOF
 
-${c_grn}=================== EXIT DONE ===================${c_off}
-EXIT_HOST = $host   (IP: $ip)
+${c_grn}=================== EXIT DONE (Hetzner) ===================${c_off}
+EXIT_HOST (SNI) = $host   (IP: $ip)
 
 Now on the ENTRY server run:
 
-   ${c_grn}bash <(curl -fsSL $RAW_URL) entry $ip${c_off}
-=================================================
+   ${c_grn}$RUN entry $ip${c_off}
+===========================================================
+EOF
+}
+
+# Mode B: non-Hetzner exit, no cert here
+setup_exit_ext(){
+  local ip
+  ask_entries_email "${1:-}" "${2:-}"
+  say "Checking this server"
+  command -v docker >/dev/null || die "Docker not found — install PasarGuard node first"
+  node_container >/dev/null
+  apt-get update -qq && apt-get install -y -qq curl >/dev/null
+  ip=$(public_ip); echo "Public IP: $ip"
+  say "Firewall"; add_entries "$ENTRIES"; write_firewall
+  say "BBR"; enable_bbr
+  cat <<EOF
+
+${c_grn}=================== EXIT DONE (non-Hetzner) ===================${c_off}
+No certificate on this server — it is issued on the ENTRY.
+
+Now on the ENTRY server run:
+
+   ${c_grn}$RUN entry-ext $ip $EMAIL${c_off}
+================================================================
 EOF
 }
 
 # ------------------------------------------------------------ ENTRY ---
+install_haproxy(){
+  if ss -ltnp "sport = :443" | grep -q LISTEN && ! ss -ltnp "sport = :443" | grep -q haproxy; then
+    die "Port 443 is busy by another program: $(ss -ltnp 'sport = :443' | tail -1)"
+  fi
+  apt-get update -qq && apt-get install -y -qq haproxy openssl curl >/dev/null
+}
+
+save_exit(){   # $1 sni  $2 public ip  $3 connect ip
+  touch "$STATE/exits.list"
+  sed -i "\|^$1 |d" "$STATE/exits.list"
+  echo "$1 $2 $3" >>"$STATE/exits.list"
+}
+
 write_haproxy(){
   local list="$STATE/exits.list" n=0 host ip conn
   [[ -s "$list" ]] || die "No exits saved"
@@ -209,6 +268,7 @@ EOF
   mv /etc/haproxy/haproxy.cfg.new /etc/haproxy/haproxy.cfg
   systemctl enable haproxy >/dev/null 2>&1
   systemctl restart haproxy
+  ok "HAProxy running"
 }
 
 test_exits(){
@@ -217,65 +277,80 @@ test_exits(){
   while read -r host ip conn; do
     if timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$host" </dev/null 2>/dev/null \
          | openssl x509 -noout -subject 2>/dev/null | grep -q "$host"; then
-      ok "$host ($ip) — relay OK"
+      ok "exit $ip  (SNI $host) — relay OK"
     else
-      warn "$host ($ip) — NO certificate (inbound not listening on $PORT yet, or this entry IP not allowed on exit)"
+      warn "exit $ip  (SNI $host) — no valid certificate yet (inbound/cert not active on exit, or this entry IP not allowed there)"
     fi
   done <"$STATE/exits.list"
-}
-
-add_exit(){   # $1 public IP, $2 optional private IP
-  local pub="${1:-}" priv="${2:-}" host
-  [[ -n "$pub" ]] || pub=$(ask "EXIT server PUBLIC IP")
-  valid_ip "$pub" || die "Invalid IP: $pub"
-  [[ -z "$priv" ]] || valid_ip "$priv" || die "Invalid private IP: $priv"
-  host=$(hz_host "$pub")
-  touch "$STATE/exits.list"
-  if grep -q "^$host " "$STATE/exits.list"; then
-    sed -i "\|^$host |d" "$STATE/exits.list"
-  fi
-  echo "$host $pub ${priv:-$pub}" >>"$STATE/exits.list"
-}
-
-setup_entry(){
-  local pub="${1:-}" priv="${2:-}" ip host
-  ip=$(my_ip); host=$(hz_host "$ip")
-  if ss -ltnp "sport = :443" | grep -q LISTEN && ! ss -ltnp "sport = :443" | grep -q haproxy; then
-    die "Port 443 is busy by another program: $(ss -ltnp 'sport = :443' | tail -1)"
-  fi
-  say "Installing HAProxy"
-  apt-get update -qq && apt-get install -y -qq haproxy openssl >/dev/null
-  add_exit "$pub" "$priv"
-  say "Writing HAProxy config"; write_haproxy; ok "HAProxy running"
-  say "BBR"; enable_bbr; ok "done"
-  say "Testing relay to exits"; test_exits
-  print_hosts
 }
 
 print_hosts(){
   local ip host ehost eip conn
   ip=$(my_ip); host=$(hz_host "$ip")
   echo -e "\n${c_grn}=================== ENTRY DONE ===================${c_off}"
-  echo "ENTRY_HOST = $host   (IP: $ip)"
+  echo "ENTRY_HOST (Address) = $host   (IP: $ip)"
   while read -r ehost eip conn; do echo "  exit $eip  ->  SNI = $ehost"; done <"$STATE/exits.list"
   echo "=================================================="
 }
 
+# Mode A entry (Hetzner exit)
+setup_entry(){
+  local pub="${1:-}" priv="${2:-}"
+  [[ -n "$pub" ]] || pub=$(ask "EXIT server PUBLIC IP")
+  valid_ip "$pub" || die "Invalid IP: $pub"
+  [[ -z "$priv" ]] || valid_ip "$priv" || die "Invalid private IP: $priv"
+  say "Installing HAProxy"; install_haproxy
+  save_exit "$(hz_host "$pub")" "$pub" "${priv:-$pub}"
+  say "HAProxy"; write_haproxy
+  say "BBR"; enable_bbr
+  say "Testing relay"; test_exits
+  print_hosts
+}
+
+# Mode B entry (non-Hetzner exit): cert for THIS entry's own hostname
+setup_entry_ext(){
+  local pub="${1:-}" email="${2:-}" ip host
+  [[ -n "$pub"   ]] || pub=$(ask "EXIT server PUBLIC IP")
+  [[ -n "$email" ]] || email=$(ask "Email for the certificate")
+  valid_ip "$pub" || die "Invalid IP: $pub"
+  say "Checking this server"
+  ip=$(my_ip); host=$(check_hz_name "$ip")
+  echo "IP: $ip   HOST: $host"
+  if ss -ltnp "sport = :80" | grep -q LISTEN; then
+    die "Port 80 is busy: $(ss -ltnp 'sport = :80' | tail -1)"
+  fi
+  if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then ufw allow 80/tcp >/dev/null; fi
+  say "Installing HAProxy"; install_haproxy
+  say "Certificate for $host"
+  install_acme "$email"
+  issue_cert "$host" "$email" "$STATE/certs" "true" || die "Certificate issuance failed"
+  save_exit "$host" "$pub" "$pub"
+  say "HAProxy"; write_haproxy
+  say "BBR"; enable_bbr
+  print_cert
+  say "Testing relay"; test_exits
+  warn "If the test failed: add the certificate above to the inbound first, then run:  $RUN status"
+  print_hosts
+}
+
 # ----------------------------------------------------------- STATUS ---
 status(){
-  if [[ -f "$STATE/exit_host" ]]; then
-    say "EXIT status"
-    echo "Host: $(cat "$STATE/exit_host")"
-    ss -tlnp | grep -q ":$PORT " && ok "Listening on $PORT" || warn "Nothing listening on $PORT"
-    echo "Cert expires: $(openssl x509 -enddate -noout -in "$(cat "$STATE/node_dir")/certs/hz.crt" | cut -d= -f2)"
+  local any=0
+  if [[ -f "$STATE/entries.list" ]]; then
+    any=1; say "EXIT status"
+    if ss -tlnp | grep -q ":$PORT "; then ok "Listening on $PORT"; else warn "Nothing listening on $PORT"; fi
     echo "Allowed entries: $(paste -sd, "$STATE/entries.list")"
   fi
+  if [[ -f "$STATE/cert_host" ]]; then
+    any=1
+    echo "Certificate: $(cat "$STATE/cert_host") — expires $(openssl x509 -enddate -noout -in "$(cat "$STATE/cert_dir")/hz.crt" | cut -d= -f2)"
+  fi
   if [[ -f "$STATE/exits.list" ]]; then
-    say "ENTRY status"
-    systemctl is-active --quiet haproxy && ok "HAProxy running" || warn "HAProxy NOT running"
+    any=1; say "ENTRY status"
+    if systemctl is-active --quiet haproxy; then ok "HAProxy running"; else warn "HAProxy NOT running"; fi
     test_exits
   fi
-  [[ -f "$STATE/exit_host" || -f "$STATE/exits.list" ]] || warn "Nothing set up on this server yet"
+  [[ $any -eq 1 ]] || warn "Nothing set up on this server yet"
 }
 
 # ------------------------------------------------------------- MAIN ---
@@ -283,30 +358,36 @@ menu(){
   echo -e "${c_cyan}
   Pronet Relay
   ------------
-  1) Setup EXIT   (this server is a PasarGuard node)
-  2) Setup ENTRY  (relay server, not a node)
-  3) EXIT : show certificate again (after renewal)
-  4) EXIT : allow another entry IP
-  5) ENTRY: add another exit
-  6) Status / test
-  0) Quit${c_off}"
+  EXIT server (PasarGuard node):
+    1) EXIT is Hetzner
+    2) EXIT is another datacenter (Turkey, ...)
+  ENTRY server (Hetzner, not a node):
+    3) ENTRY for a Hetzner exit
+    4) ENTRY for a non-Hetzner exit
+  Tools:
+    5) Show certificate again
+    6) EXIT: allow another entry IP
+    7) Status / test
+    0) Quit${c_off}"
   case "$(ask 'Choose')" in
     1) setup_exit ;;
-    2) setup_entry ;;
-    3) print_cert ;;
-    4) add_entries "$(ask 'New entry IP')"; write_firewall ;;
-    5) add_exit; write_haproxy; test_exits; print_hosts ;;
-    6) status ;;
+    2) setup_exit_ext ;;
+    3) setup_entry ;;
+    4) setup_entry_ext ;;
+    5) print_cert ;;
+    6) add_entries "$(ask 'New entry IP')"; write_firewall ;;
+    7) status ;;
     *) exit 0 ;;
   esac
 }
 
 case "${1:-}" in
   exit)      setup_exit "${2:-}" "${3:-}" ;;
+  exit-ext)  setup_exit_ext "${2:-}" "${3:-}" ;;
   entry)     setup_entry "${2:-}" "${3:-}" ;;
+  entry-ext) setup_entry_ext "${2:-}" "${3:-}" ;;
   cert)      print_cert ;;
   add-entry) add_entries "${2:-$(ask 'New entry IP')}"; write_firewall ;;
-  add-exit)  add_exit "${2:-}" "${3:-}"; write_haproxy; test_exits; print_hosts ;;
   status)    status ;;
   "")        menu ;;
   *)         die "Unknown command: $1" ;;
