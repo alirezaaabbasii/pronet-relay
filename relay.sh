@@ -105,11 +105,11 @@ print_cert(){
   dir=$(cat "$STATE/node_dir")
   exp=$(openssl x509 -enddate -noout -in "$dir/certs/hz.crt" | cut -d= -f2)
   echo -e "\n${c_ylw}Certificate for $host — expires: $exp${c_off}"
-  echo "----- Certificate (paste ALL of it) -----"
+  echo "########## CERTIFICATE (copy from BEGIN to last END) ##########"
   cat "$dir/certs/hz.crt"
-  echo "----- Key -----"
+  echo "########## KEY ##########"
   cat "$dir/certs/hz.key"
-  echo "-----------------------------------------"
+  echo "##########################"
 }
 
 setup_exit(){
